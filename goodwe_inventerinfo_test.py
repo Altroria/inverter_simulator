@@ -10,14 +10,18 @@ goodwe_inventerinfo_test.py
           解析 JSON（兼容 wrapper），自动生成设备回复并发布到上行主题
           （默认 /goodwe/ccm/client/inventerinfo）。
 
-本版新增（handle 模式）:
+本版（handle 模式):
 - 动态生成应答 Order：
   1) 若下发为 Read Holding Registers (0x03) 请求帧: F7 03 <addr><qty> ... →
      回复 Write Multiple Registers (0x10) 确认帧: F7 10 <addr><qty> + CRC(LE)
   2) 若下发为 Write Multiple Registers (0x10) 请求帧(带数据): F7 10 <addr><qty> <byteCount> <data...> →
      回复标准确认帧: F7 10 <addr><qty> + CRC(LE)
+- 仅当 Order 以 F710 开头时才处理并回复；其余一律忽略（打印日志，不发送）。
 - 若无法解析出应答帧, 回退使用 --ack-order 固定值。
-- MessageType: 默认将 41 → 42；MessageId 默认生成新的（与示例一致），可扩展镜像策略。
+- MessageType: 默认将 41 → 42；MessageId 沿用平台下发的（若下发无 MessageId 才生成）。
+- --send 开关：默认仅打印拟发送内容（DRY-RUN），加 --send 才真正发布。
+- 发布确认与错误详情日志：打印 publish 的 mid/rc、Broker 确认回调；--debug 可开启底层 MQTT 调试日志。
+- 不在回调内阻塞等待，避免潜在卡住。
 
 依赖:
   pip install paho-mqtt
@@ -32,7 +36,8 @@ from paho.mqtt import client as mqtt
 
 # -------------------------- CRC/解析工具 --------------------------
 
-def crc16_modbus(data: bytes) -> int:\n    crc = 0xFFFF
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
     for b in data:
         crc ^= b
         for _ in range(8):
@@ -128,7 +133,6 @@ def map_order_write10_to_ack(order_hex: str) -> str:
     if func != 0x10:
         return ""
     start_hi, start_lo, qty_hi, qty_lo = payload[2], payload[3], payload[4], payload[5]
-    # 可选: 校验 byteCount 与 data 长度，这里放宽
     resp_wo_crc = bytes([addr, 0x10, start_hi, start_lo, qty_hi, qty_lo])
     crc = crc16_modbus(resp_wo_crc)
     resp = resp_wo_crc + crc.to_bytes(2, "little")
@@ -154,6 +158,13 @@ def wrap_uplink(reply: Dict[str, Any], ccm_sn: str) -> Dict[str, Any]:
         "ReturnMessage": json.dumps(reply, separators=(",", ":"), ensure_ascii=False),
         "Type": 1,
     }
+
+
+def is_f710(order_hex: str) -> bool:
+    if not isinstance(order_hex, str):
+        return False
+    h = order_hex.strip().upper()
+    return len(h) >= 4 and h.startswith("F710")
 
 # -------------------------- MQTT 客户端 --------------------------
 
@@ -203,6 +214,20 @@ def publish_mode(args):
         message_id=args.message_id,
     )
     cli = make_client(args, "gw-pub")
+
+    def on_publish(client, userdata, mid):
+        print(f"【Broker确认发布】mid={mid}")
+
+    def on_disconnect(client, userdata, rc):
+        print(f"【连接断开】rc={rc}")
+
+    cli.on_publish = on_publish
+    cli.on_disconnect = on_disconnect
+    if getattr(args, "debug", False):
+        def on_log(client, userdata, level, buf):
+            print(f"【MQTT日志】level={level} {buf}")
+        cli.on_log = on_log
+
     cli.connect(args.host, args.port, keepalive=60)
     cli.loop_start()
     try:
@@ -211,9 +236,15 @@ def publish_mode(args):
             if args.wrap_up:
                 data_to_pub = wrap_uplink(payload, args.ccm_sn)
             msg = json.dumps(data_to_pub, ensure_ascii=False, separators=(",", ":"))
-            info = cli.publish(args.topic, msg, qos=args.qos, retain=False)
-            info.wait_for_publish()
-            print(f"[PUBLISHED] {args.topic} qos={args.qos} MessageId={payload['MessageId']} ({i+1}/{args.repeat})")
+            if args.send:
+                try:
+                    info = cli.publish(args.topic, msg, qos=args.qos, retain=False)
+                    print(f"【发布请求】topic={args.topic} qos={args.qos} mid={getattr(info, 'mid', '?')} rc={getattr(info, 'rc', '?')}")
+                    print(f"【已提交发送队列】{args.topic} qos={args.qos} MessageId={payload['MessageId']} ({i+1}/{args.repeat})")
+                except Exception as e:
+                    print(f"【发布异常】{type(e).__name__}: {e}")
+            else:
+                print(f"【仅打印-发布】→ {args.topic} qos={args.qos}\n{msg}")
             if i < args.repeat - 1:
                 time.sleep(args.interval)
                 if args.rotate_msgid:
@@ -228,17 +259,27 @@ def subscribe_mode(args):
     cli = make_client(args, "gw-sub")
 
     def on_connect(client, userdata, flags, rc):
-        print(f"[CONNECTED] rc={rc}, subscribing {args.topic}")
+        print(f"【已连接】rc={rc}，订阅 {args.topic}")
         client.subscribe(args.topic, qos=args.qos)
 
     def on_message(client, userdata, msg):
         try:
-            print(f"[RECV] {msg.topic} qos={msg.qos}\n{msg.payload.decode('utf-8')}\n")
+            print(f"【收到】{msg.topic} qos={msg.qos}\n{msg.payload.decode('utf-8')}\n")
         except Exception as e:
-            print(f"[RECV-ERR] {e}")
+            print(f"【接收错误】{e}")
+
+    def on_disconnect(client, userdata, rc):
+        print(f"【连接断开】rc={rc}")
 
     cli.on_connect = on_connect
     cli.on_message = on_message
+    cli.on_disconnect = on_disconnect
+
+    if getattr(args, "debug", False):
+        def on_log(client, userdata, level, buf):
+            print(f"【MQTT日志】level={level} {buf}")
+        cli.on_log = on_log
+
     cli.connect(args.host, args.port, keepalive=60)
     try:
         cli.loop_forever()
@@ -262,13 +303,28 @@ class IdemCache:
 
 def handle_mode(args):
     cli = make_client(args, "gw-handle")
+
+    def on_publish(client, userdata, mid):
+        print(f"【Broker确认发布】mid={mid}")
+
+    def on_disconnect(client, userdata, rc):
+        print(f"【连接断开】rc={rc}")
+
+    cli.on_publish = on_publish
+    cli.on_disconnect = on_disconnect
+
+    if getattr(args, "debug", False):
+        def on_log(client, userdata, level, buf):
+            print(f"【MQTT日志】level={level} {buf}")
+        cli.on_log = on_log
+
     cache = IdemCache(limit=512)
 
     sub_topic = args.sub_topic
     pub_topic = args.pub_topic
 
     def on_connect(client, userdata, flags, rc):
-        print(f"[CONNECTED] rc={rc}, subscribing {sub_topic}")
+        print(f"【已连接】rc={rc}，订阅 {sub_topic}")
         client.subscribe(sub_topic, qos=args.qos)
 
     def on_message(client, userdata, msg):
@@ -287,35 +343,60 @@ def handle_mode(args):
                 device_sn = first.get("DeviceSn") or device_sn
                 in_order = first.get("Order") or ""
 
-            print(f"[DOWNLINK] topic={msg.topic} CcmSn={ccm_sn} MessageType={message_type} MessageId={message_id} Order={in_order}")
+            print(f"【下发】主题={msg.topic} CcmSn={ccm_sn} MessageType={message_type} MessageId={message_id} Order={in_order}")
             if meta:
                 brief = {k: meta.get(k) for k in ["clientid", "topic", "qos", "retain", "transferBridgeDate"] if k in meta}
-                print(f"[DOWNLINK-META] {brief}")
+                print(f"【下发-元信息】{brief}")
+
+            # 仅处理 F710 开头的控制；其他一律忽略
+            if not in_order or not is_f710(in_order):
+                print(f"【忽略】Order 非 F710 开头：{in_order}，不发送回复")
+                return
 
             # 幂等: 相同 MessageId 返回相同应答
             cached = cache.get(message_id)
             if cached:
                 data_to_pub = cached
-            else:
-                # 生成 ACK 的 Order（优先动态映射，其次回退）
-                ack_order = compute_ack_order(in_order, args.ack_order)
-                reply_type = 42 if message_type == 41 else args.reply_msgtype
-                reply = build_payload(
-                    message_type=reply_type,
-                    ccm_sn=ccm_sn or args.ccm_sn,
-                    device_sn=device_sn,
-                    order_hex=ack_order,
-                    message_id=str(uuid.uuid4()),  # 默认生成新的 MessageId（与示例一致）
-                )
-                data_to_pub = wrap_uplink(reply, ccm_sn or args.ccm_sn) if args.wrap_up else reply
-                cache.put(message_id, data_to_pub)
+                payload_str = json.dumps(data_to_pub, ensure_ascii=False, separators=(",", ":"))
+                if args.send:
+                    try:
+                        info = client.publish(pub_topic, payload_str, qos=args.qos, retain=False)
+                        print(f"【发布请求(缓存)】topic={pub_topic} qos={args.qos} mid={getattr(info, 'mid', '?')} rc={getattr(info, 'rc', '?')}")
+                    except Exception as e:
+                        print(f"【发布异常(缓存)】{type(e).__name__}: {e}")
+                else:
+                    print(f"【仅打印-回复(缓存)】→ {pub_topic} qos={args.qos}\n{payload_str}")
+                return
+
+            # 生成 ACK 的 Order（仅针对 F710，请求→确认帧）
+            ack_order = map_order_write10_to_ack(in_order)
+            if not ack_order:
+                print(f"【警告】F710 请求解析失败，使用回退帧 {args.ack_order}")
+                ack_order = args.ack_order
+            print(f"【生成应答】Order={ack_order}")
+
+            reply_type = 42 if message_type == 41 else args.reply_msgtype
+            reply = build_payload(
+                message_type=reply_type,
+                ccm_sn=ccm_sn or args.ccm_sn,
+                device_sn=device_sn,
+                order_hex=ack_order,
+                message_id=message_id,  # 沿用平台下发的 MessageId（若无则为上面生成的）
+            )
+            data_to_pub = wrap_uplink(reply, ccm_sn or args.ccm_sn) if args.wrap_up else reply
+            cache.put(message_id, data_to_pub)
 
             payload_str = json.dumps(data_to_pub, ensure_ascii=False, separators=(",", ":"))
-            info = client.publish(pub_topic, payload_str, qos=args.qos, retain=False)
-            info.wait_for_publish()
-            print(f"[REPLY] -> {pub_topic} qos={args.qos}")
+            if args.send:
+                try:
+                    info = client.publish(pub_topic, payload_str, qos=args.qos, retain=False)
+                    print(f"【发布请求】topic={pub_topic} qos={args.qos} mid={getattr(info, 'mid', '?')} rc={getattr(info, 'rc', '?')}")
+                except Exception as e:
+                    print(f"【发布异常】{type(e).__name__}: {e}")
+            else:
+                print(f"【仅打印-回复】→ {pub_topic} qos={args.qos}\n{payload_str}")
         except Exception as e:
-            print(f"[ERR] {e}")
+            print(f"【错误】{e}")
 
     cli.on_connect = on_connect
     cli.on_message = on_message
@@ -365,6 +446,10 @@ def main():
     ap.add_argument("--reply-msgtype", type=int, default=42, help="默认回复 MessageType（非 41 映射情况）")
     ap.add_argument("--ack-order", default="F703020126F01B", help="无法解析时使用的固定 Order")
     ap.add_argument("--wrap-up", action="store_true", help="将上行包包装为 {CompressFlag, InventerSN, ReturnMessage, Type}")
+
+    # 发送与调试控制
+    ap.add_argument("--send", action="store_true", help="实际发布消息（默认仅打印 DRY-RUN）")
+    ap.add_argument("--debug", action="store_true", help="输出底层 MQTT 调试日志")
 
     args = ap.parse_args()
 

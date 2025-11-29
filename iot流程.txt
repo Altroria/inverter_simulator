@@ -1,4 +1,4 @@
-goodwe_passthrough_up  设备测试 上报数据kafka主题
+goodwe_passthrough_up  设备侧 上报数据kafka主题
 
 goodwe_remote_control  iot下发数据主题  -主包  ：发送的主题 数据
 
