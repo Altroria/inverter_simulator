@@ -11,13 +11,10 @@ goodwe_inventerinfo_test.py
           （默认 /goodwe/ccm/client/inventerinfo）。
 
 本版（handle 模式):
-- 动态生成应答 Order：
-  1) 若下发为 Read Holding Registers (0x03) 请求帧: F7 03 <addr><qty> ... →
-     回复 Write Multiple Registers (0x10) 确认帧: F7 10 <addr><qty> + CRC(LE)
-  2) 若下发为 Write Multiple Registers (0x10) 请求帧(带数据): F7 10 <addr><qty> <byteCount> <data...> →
-     回复标准确认帧: F7 10 <addr><qty> + CRC(LE)
-- 仅当 Order 以 F710 开头时才处理并回复；其余一律忽略（打印日志，不发送）。
-- 若无法解析出应答帧, 回退使用 --ack-order 固定值。
+- 仅处理两类控制：
+  1) Order 以 F710 开头 → 解析为写多个寄存器确认帧：F7 10 <addr><qty> + CRC(LE)
+  2) Order 以 F703 开头 → 固定返回 F7030200007051（读保持寄存器的固定值 0x0000，CRC 已给定）
+- 其他 Order 一律忽略（打印日志，不发送）。
 - MessageType: 默认将 41 → 42；MessageId 沿用平台下发的（若下发无 MessageId 才生成）。
 - --send 开关：默认仅打印拟发送内容（DRY-RUN），加 --send 才真正发布。
 - 发布确认与错误详情日志：打印 publish 的 mid/rc、Broker 确认回调；--debug 可开启底层 MQTT 调试日志。
@@ -165,6 +162,13 @@ def is_f710(order_hex: str) -> bool:
         return False
     h = order_hex.strip().upper()
     return len(h) >= 4 and h.startswith("F710")
+
+
+def is_f703(order_hex: str) -> bool:
+    if not isinstance(order_hex, str):
+        return False
+    h = order_hex.strip().upper()
+    return len(h) >= 4 and h.startswith("F703")
 
 # -------------------------- MQTT 客户端 --------------------------
 
@@ -348,33 +352,24 @@ def handle_mode(args):
                 brief = {k: meta.get(k) for k in ["clientid", "topic", "qos", "retain", "transferBridgeDate"] if k in meta}
                 print(f"【下发-元信息】{brief}")
 
-            # 仅处理 F710 开头的控制；其他一律忽略
-            if not in_order or not is_f710(in_order):
-                print(f"【忽略】Order 非 F710 开头：{in_order}，不发送回复")
+            # 仅处理 F710 / F703；其他一律忽略
+            if not in_order:
+                print("【忽略】缺少 Order，不发送回复")
+                return
+            if is_f710(in_order):
+                # F710: 写请求 -> 确认帧
+                ack_order = map_order_write10_to_ack(in_order)
+                if not ack_order:
+                    print(f"【警告】F710 请求解析失败，使用回退帧 {args.ack_order}")
+                    ack_order = args.ack_order
+            elif is_f703(in_order):
+                # F703: 固定回帧（读 1 寄存器，值 0x0000），CRC 已给定
+                ack_order = args.f703_fixed_ack
+            else:
+                print(f"【忽略】Order 非 F710/F703：{in_order}，不发送回复")
                 return
 
-            # 幂等: 相同 MessageId 返回相同应答
-            cached = cache.get(message_id)
-            if cached:
-                data_to_pub = cached
-                payload_str = json.dumps(data_to_pub, ensure_ascii=False, separators=(",", ":"))
-                if args.send:
-                    try:
-                        info = client.publish(pub_topic, payload_str, qos=args.qos, retain=False)
-                        print(f"【发布请求(缓存)】topic={pub_topic} qos={args.qos} mid={getattr(info, 'mid', '?')} rc={getattr(info, 'rc', '?')}")
-                    except Exception as e:
-                        print(f"【发布异常(缓存)】{type(e).__name__}: {e}")
-                else:
-                    print(f"【仅打印-回复(缓存)】→ {pub_topic} qos={args.qos}\n{payload_str}")
-                return
-
-            # 生成 ACK 的 Order（仅针对 F710，请求→确认帧）
-            ack_order = map_order_write10_to_ack(in_order)
-            if not ack_order:
-                print(f"【警告】F710 请求解析失败，使用回退帧 {args.ack_order}")
-                ack_order = args.ack_order
             print(f"【生成应答】Order={ack_order}")
-
             reply_type = 42 if message_type == 41 else args.reply_msgtype
             reply = build_payload(
                 message_type=reply_type,
@@ -446,6 +441,9 @@ def main():
     ap.add_argument("--reply-msgtype", type=int, default=42, help="默认回复 MessageType（非 41 映射情况）")
     ap.add_argument("--ack-order", default="F703020126F01B", help="无法解析时使用的固定 Order")
     ap.add_argument("--wrap-up", action="store_true", help="将上行包包装为 {CompressFlag, InventerSN, ReturnMessage, Type}")
+
+    # 新增：F703 固定回帧（可改）
+    ap.add_argument("--f703-fixed-ack", default="F7030200007051", help="当 Order 为 F703* 时固定返回的帧")
 
     # 发送与调试控制
     ap.add_argument("--send", action="store_true", help="实际发布消息（默认仅打印 DRY-RUN）")
